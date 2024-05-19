@@ -1,0 +1,966 @@
+---
+title: "Predicting Vehicle Accident Severity"
+author: "Stuart Watt"
+date: "16/04/2020"
+output:
+  pdf_document: 
+    number_sections: yes
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE,
+	include = FALSE,
+	out.width = "70%",
+	fig.align = "center",
+	fig.show = "hold",
+	fig.caption = "true"
+)
+library(tidyverse)
+library(viridis)
+library(lubridate)
+library(mlr)
+library(parallel)
+library(parallelMap)
+library(rpart.plot)
+library(ggpubr)
+# Convenience functions
+sev_fill <- function() scale_fill_manual(values = c("Slight" = "orange","Serious" = "red", "Fatal" = "black"))
+```
+
+# Introduction
+Vehicle accidents are sadly a common source of physical trauma in everyday life. Further motivated the financial burden of these events to individuals and greater society, reducing their frequency and severity has been consistently placed at a high priority both in the public and private sectors. As a consequence, great volumes of data about this domain has been collected over several decades. A well known example is the UK government road accident and safety datasets, which are published every year since 1979. Here, details about road accidents known to UK police that involve personal injury are recorded, albeit with those occurring on private roads or car parks not included.
+
+For recent years, details about accidents are recorded in a set of 3 consistent relational tables with every accident specified by an identification index. The first contains information about the accident itself, such as location, time of incident, number of vehicles and road conditions. In the second table information about involved vehicles for each accident is recorded, such as types, engine displacements and points of impact. The third table contains casualty information, such as the age, sex, and injuries sustained for each individual and event. Of interest is a classification of injury severity, with "Slight", "Severe" and "Fatal" levels. From this, an *accident severity* is defined. Slight accident severity is defined as a personal injury accident where all injuries are minor, such as whiplash, bruising and strains. Meanwhile, fatal accidents are when one or more individuals are killed though their sustained injury, either immediately or within 30 days of the accident. Lastly, severe accidents occur when none injured persons succumb to their injuries but at least one suffered an injury of greater severity such as fractured bones, deep cuts and unconsciousness. It is noted that there is a reported selection bias in collection of the data, as many minor accidents are known to not be reported to the police.
+
+In this project an attempt predicting accident severity using several other features is made. Information of all accidents recorded from 01/01/2016 to 31/12/2018 from the aforementioned data source was downloaded and imported. After features were selected, exploratory data analysis was performed along with further feature engineering and selection before a final dataset was obtained. Then data from 2016 and 2017 was used in conjunction with various algorithms to train a variety of machine learning models. Finally, performance was tested and analysed using 2018 data.
+
+# Data Import & Cleaning
+Data from variables of interest was loaded and categories recoded according to their descriptions in the data handbook. It is worth noting that some factors described in the handbook did not occur in the dataset.
+
+The following features were initially extracted: accident severity (the class feature), number of vehicles, number of casualties, date, day of week, time of day, road type, speed limit, lighting conditions, weather conditions, road surface conditions, area type and finally the average age of casualty. All variables were taken from the accidents table apart from the average age of casualty. This was obtained from the casualty table through performing a grouped average by accident index and then joining with the existing dataset. Categories were recoded from numeric values with reference to the variable lookup document provided from the data source.
+
+```{r}
+accident_cols <- cols_only(Accident_Index = col_character(),
+                           Accident_Severity = col_factor(levels = c("3", "2", "1"), ordered = FALSE), # Changed from TRUE to work woth mlr
+                           Number_of_Vehicles = col_integer(),
+                           Number_of_Casualties = col_integer(),
+                           Date = col_date(format = "%d/%m/%Y"),
+                           Day_of_Week = col_factor(),
+                           Time = col_time(format = "%T"),
+                           Road_Type = col_factor(),
+                           Speed_limit = col_integer(),
+                           Light_Conditions = col_factor(),
+                           Weather_Conditions = col_factor(),
+                           Road_Surface_Conditions = col_factor(),
+                           Urban_or_Rural_Area = col_factor())
+casualty_cols <- cols_only(Accident_Index = col_character(),
+                           Age_of_Casualty = col_integer())
+
+accidents <- list.files(path = "data/", pattern = "*dftRoadSafetyData_Accidents_201\\d[.]csv*", full.names = TRUE) %>% 
+  map_df(~read_csv(., col_types = accident_cols, na = c("-1", "NULL"))) %>% 
+  mutate(
+    Accident_Severity = fct_recode(Accident_Severity,
+                                   "Fatal" = "1",
+                                   "Serious" = "2",
+                                   "Slight" = "3"),
+    Day_of_Week = fct_recode(Day_of_Week,
+                             "Sunday" = "1",
+                             "Monday" = "2",
+                             "Tuesday" = "3",
+                             "Wednesday" = "4",
+                             "Thursday" = "5",
+                             "Friday" = "6",
+                             "Saturday" = "7"),
+    Road_Type = fct_recode(Road_Type,
+                           "Roundabout" = "1",
+                           "One way street" = "2",
+                           "Dual carriageway" = "3",
+                           "Single carriageway" = "6",
+                           "Slip road" = "7",
+                           "Unknown" = "9",
+                           "One way street/Slip road" = "12"),
+    Light_Conditions = fct_recode(Light_Conditions,
+                                  "Daylight" = "1",
+                                  "Darkness - lights lit" = "4",
+                                  "Darkness - lights unlit" = "5",
+                                  "Darkness - no lighting" = "6",
+                                  "Darkness - lighting unknown" = "7"),
+    Weather_Conditions = fct_recode(Weather_Conditions,
+                                    "Fine no high winds" = "1",
+                                    "Raining no high winds" = "2",
+                                    "Snowing no high winds" = "3",
+                                    "Fine + high winds" = "4",
+                                    "Raining + high winds" = "5",
+                                    "Snowing + high winds" = "6",
+                                    "Fog or mist" = "7",
+                                    "Other" = "8",
+                                    "Unknown" = "9"),
+    Road_Surface_Conditions = fct_recode(Road_Surface_Conditions,
+                                         "Dry" = "1",
+                                         "Wet or damp" = "2",
+                                         "Snow" = "3",
+                                         "Frost or ice" = "4",
+                                         "Flood over 3cm. deep" = "5",
+                                         "Oil or diesel" = "6",
+                                         "Mud" = "7"),
+    Urban_or_Rural_Area = fct_recode(Urban_or_Rural_Area,
+                                     "Urban" = "1",
+                                     "Rural" = "2",
+                                     "Unallocated" = "3")
+  )
+casualties <- list.files(path = "data/", pattern = "*dftRoadSafetyData_Casualties_201\\d[.]csv*", full.names = TRUE) %>% 
+  map_df(~read_csv(., col_types = casualty_cols, na = c("-1", "NULL")))
+
+rm(accident_cols, casualty_cols)
+```
+
+```{r}
+casualties <- casualties %>% 
+  group_by(Accident_Index) %>% 
+  summarise(Avg_Age_of_Casualty = mean(Age_of_Casualty)) %>% 
+  ungroup()
+
+accidents <- accidents %>% 
+  left_join(casualties, by = "Accident_Index")
+
+rm(casualties)
+```
+
+```{r}
+accidents_orig <- accidents
+```
+
+# Exploratory Data Analysis & Feature Selection
+The purpose of the exploratory data analysis was to investigate any dataset issues and to see if any insight could be gained about the dataset. Particular attention was placed on relationships between the class feature with the others.
+
+## Overview
+The following table provides an overview of the initial dataset.
+```{r echo=FALSE, results='asis', include = TRUE}
+accidents %>% count(Accident_Severity) %>% knitr::kable(caption = "Number of rows for each accident severity category.")
+#knitr::kable(summary(accidents), caption = "Summary of initial dataset")
+```
+
+First is to note that there are (thankfully) more observations with the lesser severity, with a small portion of the dataset containing fatal accidents. Below is a list of categories of categorical variables.
+```{r echo=TRUE, include = TRUE}
+accidents %>% select_if(is.factor) %>% map(~levels(.))
+```
+
+## Missing values
+Both road type and weather conditions have an "unknown" category. This is an explicit option in the vehicle accident reporting form. These were converted to `r NA` values. There are also "other" and "unallocated" levels in the weather conditions and area type variables, respectively. I decided not to convert these to `r NA` values at this stage, since these provide information about what the respective value isn't.
+
+Also, in the lighting conditions variable the "darkness-lighting unknown" category seems redundant. Information already is contained through other variables about whether an accident occurred at night or not. For this reason, this category was replaced with `r NA`, too.
+```{r}
+accidents <- accidents %>% 
+  mutate(Road_Type = na_if(Road_Type, "Unknown"),
+         Weather_Conditions = na_if(Weather_Conditions, "Unknown"),
+         Light_Conditions = na_if(Light_Conditions, "Darkness - lighting unknown"))
+```
+
+A count of missing values for each column was performed as below.
+```{r echo=FALSE, results='asis', include = TRUE}
+accidents %>% 
+  map_df(~sum(is.na(.x))) %>% 
+  select_if(. > 0) %>% 
+  pivot_longer(cols = everything(), names_to = "Feature", values_to = "Missing values") %>% 
+  arrange(desc(`Missing values`)) %>% 
+  knitr::kable(caption = "A count of missing values for each feature containing at least one.")
+```
+
+\newpage
+Proportions of missing values by class category is shown below.
+```{r results='asis', include=TRUE, echo = FALSE}
+tot_rows <- accidents %>% 
+  count(Accident_Severity, name = "Total_Observations")
+
+na_rows <- accidents %>% 
+  filter_all(any_vars(is.na(.))) %>% 
+  count(Accident_Severity, name = "Total_Missing")
+
+full_join(tot_rows, na_rows) %>% 
+  mutate(Percent_Missing = Total_Missing/Total_Observations*100) %>% 
+  knitr::kable(caption = "Missing values broken down by class category.")
+
+rm(tot_rows, na_rows)
+```
+
+Observations containing missing values make up a small fraction of the dataset (even more so with less frequent class variable categories). Given the large quantity of data, I decided to remove them. Also, categories with no instances are removed.
+```{r}
+accidents <- drop_na(accidents) %>% 
+  mutate_if(is.factor, factor)          # Remove levels with no occurances
+```
+
+## Variation & Composition
+The distribution of each feature alongside the composition of the class variable is investigated. Also the dataset is adjusted incrementally.
+
+### Number of Vehicles
+The distribution of number of vehicles was investigated.
+```{r echo=FALSE, include = TRUE, fig.cap="Number of observations for differing number of vehicles."}
+accidents %>% 
+  select(Accident_Severity, Number_of_Vehicles) %>% 
+  group_by(Accident_Severity, Number_of_Vehicles) %>% 
+  count() %>% 
+  ungroup() %>% 
+  ggplot(aes(x = Number_of_Vehicles, y = n, fill = Accident_Severity)) +
+    geom_col() +
+    coord_flip() +
+    sev_fill()
+```
+
+It is evident that the vast majority of accidents involve two vehicles or less, while several accidents have greater than 10 vehicles involved. To visualise the proportion of of serious and fatal accidents with the number of vehicles, the bars are scaled evenly in the following figure:
+```{r echo = FALSE, include = TRUE, fig.cap = "Severity proportions for differing number of vehicles."}
+accidents %>% 
+  select(Accident_Severity, Number_of_Vehicles) %>% 
+  group_by(Accident_Severity, Number_of_Vehicles) %>% 
+  count() %>% 
+  ungroup() %>% 
+  ggplot(aes(x = Number_of_Vehicles, y = n, fill = Accident_Severity)) +
+    geom_col(position = position_fill()) +
+    coord_flip() +
+    sev_fill()
+```
+There does not seem to be much relationship for number of vehicles less than four, which constitutes the majority of the dataset.
+
+\newpage
+\newpage
+### Number of Casualties
+A similar investigation to the distribution of number of casualties is performed as with the number of vehicles:
+```{r echo = FALSE, include = TRUE, fig.cap="Number of observations for differing number of casualties."}
+accidents %>% 
+  select(Accident_Severity, Number_of_Casualties) %>% 
+  group_by(Accident_Severity, Number_of_Casualties) %>% 
+  count() %>% 
+  ungroup() %>% 
+  ggplot(aes(x = Number_of_Casualties, y = n, fill = Accident_Severity)) +
+    geom_col() +
+    coord_flip() +
+    sev_fill()
+```
+
+We note that the minimum number of casualties observed is 1, which also happens to be most frequent. No accidents record 0 casualties because these incidents are not defined as being an accident according to the data source definition. The distribution decays quickly, with a few outlier observations with greater than 20 casualties.
+
+\newpage
+\newpage
+
+We similarly look at the proportions of each bar:
+```{r echo = FALSE, include = TRUE, fig.cap="Severity proportions for differing number of casualties."}
+accidents %>% 
+  select(Accident_Severity, Number_of_Casualties) %>% 
+  group_by(Accident_Severity, Number_of_Casualties) %>% 
+  count() %>% 
+  ungroup() %>% 
+  ggplot(aes(x = Number_of_Casualties, y = n, fill = Accident_Severity)) +
+    geom_col(position = position_fill()) +
+    coord_flip() +
+    sev_fill()
+```
+
+There seems to be an relationship between the number of casualties and the accident severity. This makes sense, since the larger the number of people injured the greater the probability that one injury will be severe or lead to a fatality. Unfortunately no information about the number of passengers of vehicles is given in the dataset.
+
+\newpage
+### Time and Date
+There are several ways to view the temporal aspect of this dataset. One option is to look at the distribution as a whole.
+```{r echo = FALSE, include=TRUE, fig.caption = "Distribution of accident severities by date. Each accident severity is scaled to give the same area."}
+accidents %>% 
+  ggplot(aes(x = Date, fill = Accident_Severity)) +
+    geom_density(alpha = 0.5) +
+    sev_fill()
+```
+
+These distributions do not seem to reveal any clear pattern. Distributions by time and day of week however show some insights:
+```{r echo = FALSE, include = TRUE, fig.cap="accident severity distributions by time and day of week."}
+# accidents %>% 
+#   select(Accident_Severity, Time) %>% 
+#   drop_na() %>% 
+#   ggplot(aes(x = Time, fill = Accident_Severity)) +
+#     geom_density(alpha = 0.5) +
+#     sev_fill()
+#   
+accidents %>% 
+  select(Accident_Severity, Time, Day_of_Week) %>% 
+  drop_na() %>% 
+  ggplot(aes(x = Time, fill = Accident_Severity)) +
+    geom_density(alpha = 0.5) +
+    sev_fill() +
+    facet_wrap(~Day_of_Week)
+```
+
+\newpage
+
+It is evident that the distribution of greater severity accidents is more time invariant. We see that fatal accidents occur with greater relative frequencies in hours close to midnight. However, this may be because of lighting conditions.
+
+We see that overall the slight and serious density curves are similar. Note that peaks occur from Monday to Friday at around 9am and 5pm: this is likely due to greater traffic from people commuting to and from work. In the weekend there is a greater likelihood of accidents early in the morning and late at night. The similarity of weekday and weekend daily distributions motivates me to replace the day of week column with a boolean "Weekend" column.
+```{r}
+accidents <- accidents %>% 
+  mutate(Weekend = map_lgl(Day_of_Week, ~isTRUE(. %in% c("Saturday", "Sunday"))))
+```
+
+The problem with encoding the time of day as a simple numerical number is that it does not convey information about cyclical nature. If one were to encode time as the number of seconds past midnight, then 23:59:59 would be maximally different from 00:00:00, even though they are practically speaking very similar. One way to represent this cyclical nature would be through sinusoidal functions:
+
+```{r include = TRUE, echo = FALSE, fig.cap = "Accident severity distributions of sinusoidal transforms of time. Distributions are further broken down by weekday (left) or weekend (right)."}
+accidents <- accidents %>% 
+  mutate(Sine_Time = sin(as.integer(Time)*2*pi/(60*60*24)),
+         Cosine_Time = cos(as.integer(Time)*2*pi/(60*60*24)))
+
+accidents %>%
+  select(Accident_Severity, Weekend, Sine_Time, Cosine_Time) %>% 
+  pivot_longer(cols = c("Sine_Time", "Cosine_Time"), values_to = "Time_Transform", names_to = "Transform_Function", names_ptypes = factor()) %>% 
+  ggplot(aes(x = Time_Transform, fill = Accident_Severity)) +
+    geom_density(alpha = 0.5) +
+    sev_fill() +
+    facet_grid(rows = vars(Transform_Function), cols = vars(Weekend))
+```
+
+\newpage
+
+Here we see some separation of densities. These two transformations are included as engineered features. The question remains how much of the observed separation is due to lighting conditions, rather than the time itself.
+
+\newpage
+
+### Road Type
+```{r include=TRUE, echo=FALSE, out.width = "0.49%", fig.cap = "Distributions and proportions of accident severity by road type."}
+accidents %>% 
+  select(Accident_Severity, Road_Type) %>% 
+  ggplot(aes(x = fct_infreq(Road_Type), fill = Accident_Severity)) +
+    geom_bar() +
+    coord_flip() +
+    sev_fill() +
+    ylab("Road_Type")
+
+accidents %>% 
+  select(Accident_Severity, Road_Type) %>% 
+  ggplot(aes(x = fct_infreq(Road_Type), fill = Accident_Severity)) +
+    geom_bar(position = "fill") +
+    coord_flip() +
+    sev_fill() +
+    ylab("Road_Type") +
+    xlab("Proportion")
+```
+
+There seems to be some impact here, but it is hard to know whether this provides any information other than what speed limit might.
+
+\newpage
+### Speed Limit
+When looking at the distribution broken down by accident type, an interesting relationship is found.
+```{r include = TRUE, echo = FALSE, fig.cap = "Accident severity distributions against speed limit."}
+accidents %>%
+  select(Accident_Severity, Speed_limit) %>% 
+  ggplot(aes(x = Speed_limit, fill = Accident_Severity)) +
+    geom_bar() +
+    sev_fill() +
+    facet_wrap(~Accident_Severity, scales = "free_y")
+```
+
+We see that the relative frequency of more severe accidents increases with the speed limit. This of course makes intuitive sense as a greater mean kinetic energy of traffic is implied. It is also evident that 30mph is the modal speed.
+
+\newpage
+### Light Conditions
+Most accidents happen in daylight, where there is most likely more traffic. Further investigation reveals a higher proportion of fatal accidents with darkness and no lighting or lights unlit.
+```{r include = TRUE, echo = FALSE, fig.cap = "Light condition and accident severity distribution."}
+accidents %>% 
+  select(Accident_Severity, Light_Conditions) %>% 
+  ggplot(aes(x = fct_infreq(Light_Conditions), fill = Accident_Severity)) +
+    geom_bar() +
+    sev_fill() +
+    coord_flip() +
+    xlab("Light_Conditions")
+```
+
+A new boolean feature is introduced recording whether daylight or external lighting was present at the event. While the vast majority of cases occur when lighting is on, fatal and serious accidents occur with higher relative frequency when there is no lighting. However, only a small portion of the dataset represents instances with no lighting.
+
+This variable is somewhat redundant for instances during daytime, but perhaps it will aid classification in night-time.
+```{r include = TRUE, echo=FALSE, fig.cap = "Accident severity distributions against presence of external lighting."}
+accidents <- accidents %>% 
+  mutate(Lighting = map_lgl(Light_Conditions, ~isTRUE(. %in% c("Daylight", "Darkness - lights lit"))))
+
+# accidents %>% 
+#   select(Light_Conditions, Lighting) %>% 
+#   distinct()
+# 
+# accidents %>% 
+#   select(Accident_Severity, Lighting) %>% 
+#   ggplot(aes(x = Lighting, fill = Accident_Severity)) +
+#     geom_bar() +
+#     sev_fill() +
+#     coord_flip()
+# 
+# accidents %>% 
+#   select(Accident_Severity, Lighting) %>% 
+#   ggplot(aes(x = Lighting, fill = Accident_Severity)) +
+#     geom_bar(position = "fill") +
+#     sev_fill() +
+#     coord_flip()
+
+accidents %>% 
+  select(Accident_Severity, Lighting) %>% 
+  ggplot(aes(x = Lighting, fill = Accident_Severity)) +
+    geom_bar() +
+    sev_fill() +
+    facet_wrap(~Accident_Severity, scales = "free_y")
+```
+
+\newpage
+
+### Weather Conditions
+The vast majority of accidents occur with fine weather and no high winds:
+```{r include = TRUE, echo = FALSE, fig.cap = "Weather conditions and accident severity distribution."}
+accidents %>% 
+  select(Accident_Severity, Weather_Conditions) %>% 
+  ggplot(aes(x = fct_infreq(Weather_Conditions), fill = Accident_Severity)) +
+    geom_bar() +
+    sev_fill() +
+    coord_flip() +
+    xlab("Weather_Conditions")
+
+# accidents %>% 
+#   select(Accident_Severity, Weather_Conditions) %>% 
+#   ggplot(aes(x = fct_infreq(Weather_Conditions), fill = Accident_Severity)) +
+#     geom_bar(position = "fill") +
+#     sev_fill() +
+#     coord_flip()
+# 
+# accidents %>% 
+#   select(Accident_Severity, Weather_Conditions) %>% 
+#   ggplot(aes(x = fct_infreq(Weather_Conditions), fill = Accident_Severity)) +
+#     geom_bar() +
+#     sev_fill() +
+#     coord_flip() +
+#     facet_wrap(~Accident_Severity, scales = "free_x")
+```
+
+Proportional analysis of the accident severity by weather conditions does not reveal any insights with confidence, as so few data is collected for observations in some categories. To tackle this, two new boolean columns are made: one for precipitation/fog and the other for high winds:
+```{r}
+accidents %>% 
+  mutate(High_Winds = str_detect(Weather_Conditions, "\\+ high winds"),
+         Precipitation_or_Fog = str_detect(Weather_Conditions, "Raining|Snowing|Fog")) %>% 
+  select(Weather_Conditions, High_Winds, Precipitation_or_Fog) %>% 
+  distinct()
+
+accidents <- accidents %>% 
+  mutate(High_Winds = str_detect(Weather_Conditions, "\\+ high winds"),
+         Precipitation_or_Fog = str_detect(Weather_Conditions, "Raining|Snowing|Fog"))
+accidents[accidents$Weather_Conditions == "Other",][c("High_Winds","Precipitation_or_Fog")] <- tibble(High_Winds = NA, Precipitation_or_Fog = NA)
+```
+
+```{r include = TRUE, echo=FALSE, out.width = "49%", fig.cap = "Accident severity distributions against presence of precipitation or fog and high winds."}
+# accidents %>% 
+#   ggplot(aes(x = Precipitation_or_Fog, fill = Accident_Severity)) +
+#     geom_bar() +
+#     sev_fill() +
+#     coord_flip()
+# accidents %>% 
+#   ggplot(aes(x = Precipitation_or_Fog, fill = Accident_Severity)) +
+#     geom_bar(position = "fill") +
+#     sev_fill() +
+#     coord_flip()
+# accidents %>% 
+#   ggplot(aes(x = High_Winds, fill = Accident_Severity)) +
+#     geom_bar() +
+#     sev_fill() +
+#     coord_flip()
+# accidents %>% 
+#   ggplot(aes(x = High_Winds, fill = Accident_Severity)) +
+#     geom_bar(position = "fill") +
+#     sev_fill() +
+#     coord_flip()
+accidents %>% 
+  ggplot(aes(x = as.factor(Precipitation_or_Fog), fill = Accident_Severity)) +
+    geom_bar() +
+    sev_fill() +
+    scale_x_discrete(labels = c("FALSE", "TRUE")) +
+    xlab("Precipitation_or_Fog") +
+    facet_wrap(~Accident_Severity, scales = "free_y")
+accidents %>% 
+  ggplot(aes(x = as.factor(High_Winds), fill = Accident_Severity)) +
+    geom_bar() +
+    sev_fill() +
+    scale_x_discrete(labels = c("FALSE", "TRUE")) +
+    xlab("High_Winds") +
+    facet_wrap(~Accident_Severity, scales = "free_y")
+```
+
+Surprisingly there does not seem to be much difference. Both these variables are highly unbalanced, but I argue that the high winds variable is too unbalanced for any practicality. As such, this was removed from the dataset along with the unknown precipitation or fog rows.
+```{r}
+accidents <- accidents %>% 
+  select(-High_Winds) %>% 
+  drop_na()
+```
+
+\newpage
+
+### Road Surface Conditions
+This variable is clearly highly unbalanced. The low amount of instances with the 3 least popular categories raises doubts about any observed patterns regarding proportional severities. It seems logical to simplify this classification.
+```{r include = TRUE, echo = FALSE, out.width = "49%", fig.cap = "Distribution of road surface conditions and accident severity."}
+accidents %>% 
+  select(Accident_Severity, Road_Surface_Conditions) %>% 
+  ggplot(aes(x = fct_infreq(Road_Surface_Conditions), fill = Accident_Severity)) +
+    geom_bar() +
+    sev_fill() +
+    xlab("Road_Surface_Conditions") +
+    coord_flip()
+
+accidents <- accidents %>% 
+  mutate(Dry_Road_Surface = map_lgl(Road_Surface_Conditions, ~isTRUE(.x == "Dry")))
+
+accidents %>% 
+  ggplot(aes(x = Dry_Road_Surface, fill = Accident_Severity)) +
+    geom_bar() +
+    sev_fill() +
+    facet_wrap(~Accident_Severity, scales = "free_y")
+```
+
+Interestingly, there seems to be little relationship. However, fatal accidents appear to be relatively more frequent when the road surface is not dry. Note that this does not comment on whether accidents occur with greater relative frequency in non-dry road conditions, just that the proportion of accident severities do not seem to change much.
+
+\newpage
+
+### Area Type
+The distribution of area type is as below. We see that more severe accidents occur with greater relative frequencies in Rural areas, although more accidents occur in urban areas overall. Perhaps the distribution of speed limits differ in area types.
+```{r results='asis', include=TRUE, echo=FALSE}
+accidents %>% 
+  count(Urban_or_Rural_Area, Accident_Severity) %>% 
+  knitr::kable(caption = "Area type with accident severity distribution.")
+```
+
+To simplify categorisation, rural and unallocated area types are merged in a new binary column.
+```{r}
+# accidents %>% 
+#   select(Accident_Severity, Urban_or_Rural_Area) %>% 
+#   ggplot(aes(x = Urban_or_Rural_Area, fill = Accident_Severity)) +
+#     geom_bar() +
+#     sev_fill() +
+#     coord_flip()
+# 
+# accidents %>% 
+#   select(Accident_Severity, Urban_or_Rural_Area) %>% 
+#   ggplot(aes(x = Urban_or_Rural_Area, fill = Accident_Severity)) +
+#     geom_bar(position = "fill") +
+#     sev_fill() +
+#     coord_flip()
+```
+
+```{r}
+accidents <- accidents %>% 
+  mutate(Urban = map_lgl(Urban_or_Rural_Area, ~isTRUE(.x == "Urban")))
+# accidents %>% 
+#   ggplot(aes(x = Urban, fill = Accident_Severity)) +
+#     geom_bar() +
+#     sev_fill() +
+#     coord_flip()
+# accidents %>% 
+#   ggplot(aes(x = Urban, fill = Accident_Severity)) +
+#     geom_bar(position = "fill") +
+#     sev_fill() +
+#     coord_flip()
+```
+
+
+### Average Age of Casualty
+There is an interesting relationship between the average age of casualty and the distributions when grouped by severity. Accidents of higher severity occur with greater relative frequency with those older in age. This may be because of increased frailty of aged populations, or perhaps a non-uniform distribution of means of transport with age.
+```{r include = TRUE, echo = FALSE, out.width = "49%", fig.cap = "Distribution of accident severity with average age of casualty."}
+accidents %>% 
+  ggplot(aes(x = Avg_Age_of_Casualty, fill = Accident_Severity)) +
+    geom_histogram() +
+    sev_fill()
+accidents %>% 
+  ggplot(aes(x = Avg_Age_of_Casualty, fill = Accident_Severity)) +
+    geom_density(alpha = 0.5) +
+    sev_fill()
+```
+
+## Covariation
+Here I will look at the interaction of two or more non-class variables at once with the aim of gaining understanding about some of the previous insights.
+
+### Number of Vehicles and Casualties
+We see that the most frequently occurring combination is one casualty with two vehicles involved. The distribution appears quite smooth. Note the logarithmic colour scale. Observations with few vehicles and many casualties perhaps involve transport vehicles such as buses.
+```{r include=TRUE, echo = FALSE, fig.cap = "Two dimensional histogram of number of casualties and vehicles."}
+counts <- count(accidents, Number_of_Vehicles, Number_of_Casualties)
+
+breaks <- seq(from = log(min(counts$n)), log(max(counts$n)), length.out = 5) %>% 
+  exp() %>% 
+  ceiling()
+
+ggplot(data = counts, aes(x = Number_of_Vehicles, y = Number_of_Casualties, fill = n)) +
+  geom_tile() +
+  scale_fill_viridis(trans = "log", breaks = breaks, limits = range(breaks))
+
+rm(counts, breaks)
+```
+
+\newpage
+
+### Speed Limit & Area Type
+The most probable speed limit for accidents is 30mph and 60mph for urban and non-urban environments, respectively. This holds true even when broken down by accident severity. Perhaps these speed limits are the most common across UK roads when taking traffic into account. Non-urban areas have a greater distribution of accidents by speed limit.
+```{r include = TRUE, echo = FALSE, fig.cap = "Accident Severity Distribution by Area Type and Speed Limit."}
+# accidents %>% 
+#   select(Accident_Severity, Urban, Speed_limit) %>% 
+#   count(Urban, Speed_limit) %>% 
+#   ggplot(aes(x = Speed_limit, y = Urban, fill = n)) +
+#     geom_tile() +
+#     scale_fill_viridis()
+
+accidents %>% 
+  select(Accident_Severity, Urban, Speed_limit) %>% 
+  group_by(Accident_Severity, Urban, Speed_limit) %>% 
+  summarise(n = n()) %>% 
+  group_by(Accident_Severity) %>% 
+  mutate(freq = n/sum(n)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = Speed_limit, y = Urban, fill = freq)) +
+    geom_tile() +
+    scale_fill_viridis() +
+    facet_wrap(~Accident_Severity)
+```
+
+\newpage
+
+## Final Feature Selection
+Correctly identifying features to use is a critical component of any machine learning task. Too few can result in oversimplification, while too many leads to the so called "curse of dimensionality" phenomenon, where (among other problems) the feature space becomes too sparse for the amount of training data available. Here I justify the chosen features for classification purposes.
+
+Firstly, it is obvious not to use the accident index as a predictor variable.
+
+In the temporal analysis during EDA, interesting relationships were found between accident severity and both the time of day and day of week variables. These were refined into two three new features: two containing sine and cosine transforms of the time of day variable to represent the cyclical aspect of time of day, and one of boolean type signifying if the accident occurred on the weekend or not. Meanwhile, no other interesting relationships were found. It is possible that seasonality is related to the target variable through various means, but these are likely represented through other variables, for example those describing weather and road conditions.
+
+The lighting conditions were used to construct a variable signifying whether the environment was lit or not, either naturally or artificially. This simplifies what the essential component relevant for this classification purposes. As such, I remove the original light conditions feature in place with this.
+
+The weather conditions variable contained many categories and was impractically unbalanced, this is replaced with a single boolean feature recording whether there was any fog or precipitation present at the accident.
+
+A few features contained not only a categorisation schema that was not ideal for the purposes of this research, but also a high degree of imbalance with minority categories containing few instances. The weather conditions variable was replaced with a single boolean feature recording whether there was any fog or precipitation present at the accident. Also, the road surface conditions variable was replaced with one signifying dry road surface conditions and the variable signifying area type was made into a boolean variable.
+```{r}
+chosen_columns <- c("Accident_Severity", "Number_of_Vehicles", "Number_of_Casualties", "Sine_Time", "Cosine_Time", "Weekend", "Road_Type", "Speed_limit",
+                    "Lighting", "Precipitation_or_Fog", "Dry_Road_Surface", "Urban", "Avg_Age_of_Casualty")
+accidents <- accidents %>% 
+  mutate(year = year(Date)) %>% 
+  select(all_of(chosen_columns), year) %>% 
+  mutate_if(is.logical, as.integer)
+
+rm(chosen_columns)
+```
+
+Altogether, the final dataset may compared to the original as follows:
+```{r include=TRUE, echo=FALSE, results='asis'}
+tibble(Dataset = c("Original", "Final")) %>% 
+  mutate(Rows = c(nrow(accidents_orig), nrow(accidents))) %>% 
+  mutate(
+    Percent_Slight = c(nrow(filter(accidents_orig, Accident_Severity == "Slight")),nrow(filter(accidents, Accident_Severity == "Slight")))*100/Rows,
+    Percent_Serious = c(nrow(filter(accidents_orig, Accident_Severity == "Serious")),nrow(filter(accidents, Accident_Severity == "Serious")))*100/Rows,
+    Percent_Fatal = c(nrow(filter(accidents_orig, Accident_Severity == "Fatal")),nrow(filter(accidents, Accident_Severity == "Fatal")))*100/Rows,
+  ) %>% 
+  knitr::kable(caption = "Summary of original and final dataset.")
+rm(accidents_orig)
+```
+
+# Modelling
+## Strategy
+```{r}
+training <- accidents %>% 
+  filter(year %in% 2016:2017) %>% 
+  select(-year)
+testing <- accidents %>%
+  filter(year == 2018) %>% 
+  select(-year)
+
+n_train_fatal <- training %>% 
+  filter(Accident_Severity == "Fatal") %>% 
+  nrow()
+set.seed(0)
+training <- training %>% 
+  group_by(Accident_Severity) %>% 
+  sample_n(n_train_fatal, replace = FALSE)
+rm(n_train_fatal)
+```
+
+The dataset is split into training and testing sets by year, with observations in 2016-2017 as the training set and 2018 as the testing set. Furthermore, the class distribution in the training set is balanced through under-sampling. Specifically, samples of observations with non-minority classes are taken without replacement until each accident severity category contains equal amount of instances. The total number of observations in the training set becomes `r nrow(training)`, with each class category containing `r nrow(training)/3` each.
+```{r}
+#count(training, Accident_Severity)
+```
+
+Afterword, this dataset is used along with with cross validation methods to train various models from different classification algorithms. An attempt to select optimal hyperparameters is done through a controlled search of the hyperparameter space. Accuracy is chosen as the performance metric to be optimised. This is chosen as it is seen to be the most appropriate given the balanced nature of the under-sampled training set.
+```{r}
+task_train <- makeClassifTask(data = training, target = "Accident_Severity")
+task_test <- makeClassifTask(data = testing, target = "Accident_Severity")
+
+kfolds_for_tuning <- makeResampleInstance(desc = makeResampleDesc(method = "CV", predict = "test", iters = 10, stratify = TRUE), 
+                                          task = task_train)
+holdout_for_tuning <- makeResampleInstance(desc = makeResampleDesc(method = "Holdout", predict = "test", split = 1/10, stratify = TRUE), 
+                                           task = task_train)
+```
+
+## Algorithms
+### Decision Tree
+Firstly, a simple decision tree algorithm from the "rpart" package was chosen. The Gini index was used as the splitting criteria and the following parameters was adjusted:
+1. *"maxdepth"*: the maximum depth of the decision tree,
+2. *"cp"*: a parameter determining the minimum improvement in performance for node splitting,
+3. *"minsplit"*: the minimum number of cases in a node which can result in splitting,
+4. *"minbucket"*: the minimum number of cases in a leaf node. 
+These were tested in a grid search fashion using 10-fold cross validation using the same splits for each hyperparameter set. Results are visualised below.
+```{r}
+learner_rpart <- makeLearner("classif.rpart", fix.factors.prediction = TRUE)
+params_rpart <- makeParamSet(makeDiscreteParam("maxdepth", 2:12),
+                             makeDiscreteParam("cp", c(0.0001, 0.0005, 0.001, 0.005, 0.01)),
+                             makeDiscreteParam("minsplit", c(1, 10, 20)),
+                             makeDiscreteParam("minbucket", c(1, 5, 10, 100)))
+tuneControl_rpart <- makeTuneControlGrid()
+set.seed(0)
+parallelStartSocket(cpus = detectCores())
+tuneRes_rpart <- tuneParams(learner = learner_rpart, 
+                            task = task_train, 
+                            resampling = kfolds_for_tuning, 
+                            measures = list(acc), 
+                            par.set = params_rpart, 
+                            control = tuneControl_rpart)
+parallelStop()
+```
+
+```{r include = TRUE, echo = FALSE, out.width = "100%", fig.caption = "Mean accuracy results from the hyperparameter search, broken down by parameter."}
+plot_rpart_param_res <- function(res){
+  params <- c("maxdepth", "cp", "minsplit", "minbucket")
+  rt <- as_tibble(res$opt.path)
+    #pivot_longer(cols = c("maxdepth", "cp", "minsplit", "minbucket"), names_to = "Parameter", values_to = "Param.Value")
+  p1 <- rt %>% 
+    select(maxdepth, acc.test.mean) %>% 
+    ggplot(aes(x = acc.test.mean, y = maxdepth, group = maxdepth)) +
+      geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+      xlab("Mean K-fold Test Accuracy") +
+      ylab(params[1])
+  p2 <- rt %>% 
+    select(cp, acc.test.mean) %>% 
+    ggplot(aes(x = acc.test.mean, y = cp, group = cp)) +
+      geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+      xlab("Mean K-fold Test Accuracy") +
+      ylab(params[2])
+  p3 <- rt %>% 
+    select(minsplit, acc.test.mean) %>% 
+    ggplot(aes(x = acc.test.mean, y = minsplit, group = minsplit)) +
+      geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+      xlab("Mean K-fold Test Accuracy") +
+      ylab(params[3])
+  p4 <- rt %>% 
+    select(minbucket, acc.test.mean) %>% 
+    ggplot(aes(x = acc.test.mean, y = minbucket, group = minbucket)) +
+      geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+      xlab("Mean K-fold Test Accuracy") +
+      ylab(params[4])
+  
+  mltplt <- ggarrange(p1, p2, p3, p4,
+                      ncol = 2, nrow = 2)
+  return(mltplt)
+}
+plot_rpart_param_res(tuneRes_rpart)
+```
+
+As shown above a variability of about 5% mean accuracy was exhibited. The most accurate configuration tested is as follows:
+```{r include = TRUE, echo=FALSE}
+tuneRes_rpart
+```
+
+These parameters were then trained for the whole (balanced through under-sampling) dataset. The resulting model is shown in the figure below.
+```{r include=TRUE, echo = FALSE, fig.cap = "Trained decision tree model diagram."}
+set.seed(0)
+rpart_train <- train(setHyperPars(learner_rpart, par.vals = tuneRes_rpart$x), task = task_train)
+
+rpart.plot(getLearnerModel(rpart_train), roundint = FALSE,
+           box.palette = "BuBn",
+           type = 0,
+           tweak = 0.9,
+           space = 0,
+           gap = 0,
+           legend.y = 1.0)
+#calculateConfusionMatrix(predict(tree_train, task_test))
+#plotOptPath(tuneRes_rpart$opt.path)
+```
+
+We see that speed limit is present at the root of the tree along with other nodes, providing evidence that it is an important variable for classification.
+
+\newpage
+
+### Random Forest
+An ensemble of decision trees were then used through the random forest algorithm implemented in the "randomForest" package. The number of individual learners was set at 300. Also a search was made for the optimal value of the "mtry" parameter which controls the number of features that are randomly sampled at each node. The results are as follows.
+```{r}
+learner_rf <- makeLearner("classif.randomForest", fix.factors.prediction = TRUE)
+params_rf <- makeParamSet(makeIntegerParam("ntree", 300, 300),
+                          makeDiscreteParam("mtry", seq(1, ncol(training)-1)))
+tuneControl_rf <- makeTuneControlGrid()
+
+parallelStartSocket(cpus = detectCores())
+set.seed(0)
+tuneRes_rf <- tuneParams(learner = learner_rf, 
+                         task = task_train, 
+                         resampling = kfolds_for_tuning, 
+                         measures = list(acc), 
+                         par.set = params_rf, 
+                         control = tuneControl_rf)   
+parallelStop()
+```
+
+```{r include=TRUE, echo = FALSE, fig.cap = "Mean k-fold cross validation test accuracies against varying mtry parameter values."}
+as_tibble(tuneRes_rf$opt.path) %>% 
+  ggplot(aes(x = as.integer(mtry), y = acc.test.mean)) +
+    geom_point() +
+    geom_line() +
+    scale_x_continuous(breaks = c(2, 4, 6, 8, 10, 12), limits = c(1,12)) +
+    ylab("Mean K-fold Test Accuracy") +
+    xlab("mtry")
+    
+```
+
+\newpage
+
+Similar mean accuracies are exhibited as that obtained with the single decision tree. A general negative trend is seen with increasing the "mtry" parameter past 2, suggesting that greater variety of trees yields better performance.
+
+A model with the optimal parameters found is trained on the training set. The following plot is used to check if the number of trees is adequate. Since the error rates stabilise with increasing trees it appears that there are enough learners.
+```{r include=TRUE, echo = FALSE, fig.cap = "Out of bag mean error along with error rates by category types."}
+set.seed(0)
+rf_train <- train(setHyperPars(learner_rf, par.vals = tuneRes_rf$x), task = task_train)
+rf_model <- getLearnerModel(rf_train)
+
+plot(rf_model)
+
+legend("topright", colnames(rf_model$err.rate),
+       col = 1:length(colnames(rf_model$err.rate)),
+       lty = 1:length(colnames(rf_model$err.rate)))
+```
+
+\newpage
+
+We note the poor performance with correctly classifying serious accident severity instances.
+
+The random forest algorithm also yields a measure of feature importance. The results from the training are as follows:
+```{r results='asis', include = TRUE, echo = FALSE}
+rf_model$importance %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Feature") %>% 
+  arrange(desc(MeanDecreaseGini)) %>% 
+  knitr::kable(caption = "Feature importances as reported by the random forest algorithm.")
+```
+
+This ranking provides interesting insight when considered with the decision tree model diagram and EDA investigations.
+
+\newpage
+
+### Naive Bayes
+The naive bayes algorithm as implemented in the "e1071" package was used to complement the tree based algorithms used previously. No hyperparameters are available to tune for this algorithm. The same folds for k-fold cross validation as before was used to test the algorithm, obtaining the following results:
+```{r include=TRUE, echo=FALSE}
+learner_naiveBayes <- makeLearner("classif.naiveBayes", fix.factors.prediction = TRUE)
+parallelStartSocket(cpus = detectCores())
+set.seed(0)
+training_res_naiveBayes <- resample(learner = learner_naiveBayes, task = task_train, resampling = kfolds_for_tuning, measures = list(acc))
+parallelStop()
+training_res_naiveBayes
+```
+Once again, a model was trained on the full training set.
+```{r}
+set.seed(0)
+naiveBayes_train <- train(learner = learner_naiveBayes, task = task_train)
+```
+
+
+### Support Vector Machine
+Finally, classification by partitioning feature space was attempted using the SVM algorithm as implemented in the "e1071" package. The dataset was scaled as by default in the function implementation. Both linear and quadratic versions were tested using a polynomial kernel with degree 1 and 2, respectively. Also, the cost parameter was adjusted. Unfortunately, due to the computational expense of training the algorithm k-fold cross validation was not feasible. Stratified holdout using 10% training and 90% testing on the training dataset was used instead, with the same split being used for each parameter set. Despite the lower portion of training data in this scenario, it seems likely that adequate data was available to select parameters adequately given the number of instances of the dataset.
+```{r}
+learner_svm <- makeLearner("classif.svm")
+params_svm <- makeParamSet(
+  makeDiscreteParam("kernel", values = c("polynomial")),
+  makeIntegerParam("degree", lower = 1, upper = 2),
+  makeDiscreteParam("cost", c(0.1, 1, 10, 100))
+  )
+set.seed(0)
+# tuneControl_svm <- makeTuneControlRandom(maxit = 10L)
+tuneControl_svm <- makeTuneControlGrid()
+parallelStartSocket(cpus = detectCores())
+set.seed(0)
+tuneRes_svm <- tuneParams(learner = learner_svm, 
+                          task = task_train, 
+                          resampling = kfolds_for_tuning, 
+                          measures = list(acc, timetrain), 
+                          par.set = params_svm, 
+                          control = tuneControl_svm)
+parallelStop()
+#tuneRes_svm$opt.path %>% as_tibble
+```
+
+The results are shown in the plot below.
+```{r include=TRUE, echo = FALSE, fig.cap = "Accuracies of myperparameter search for support vector machine algorithm on training set using a hold out method."}
+tuneRes_svm$opt.path %>% 
+  as_tibble() %>% 
+  mutate(cost = as.numeric(as.character(cost)),
+         degree = as.factor(degree)) %>% 
+  ggplot(aes(x = cost, y = acc.test.mean, colour = degree, group = degree)) +
+    geom_point() +
+    geom_line() +
+    ylab("Holdout Test Accuracy")
+```
+
+We see that polynomial of degree 2 gave consistently greater accuracy than with using a linear kernel and that increasing the cost parameter resulted in increasing accuracy. The optimal hyperparameter set found was used to train a model with the full training set.
+```{r}
+set.seed(0)
+svm_train <- train(setHyperPars(learner_svm, par.vals = tuneRes_svm$x), task = task_train)
+```
+
+A visualisation of the feature space partitioning is shown below using both the training model and data. The two chosen variables, average age of casualty and cosine of time, were previously ranked as most important by the random forest classifier. The space here is not well separated, highlighting classification challenges with this dataset.
+```{r include = TRUE, echo = FALSE, fig.cap = "A sample visualisation of feature space partitioning with the model trained using all training data. Note apparent lack of separation."}
+getLearnerModel(svm_train) %>% plot(data = training, formula = Avg_Age_of_Casualty ~ Cosine_Time)
+```
+
+# Results
+The trained models were tested on the testing data consisting of accidents occurring in 2018. Results are shown in the table below.
+```{r}
+test_rpart <- predict(rpart_train, task = task_test)
+test_rf <- predict(rf_train, task = task_test)
+test_naiveBayes <- predict(naiveBayes_train, task = task_test)
+test_svm <- predict(svm_train, task = task_test)
+```
+
+```{r}
+pm <- list(acc, bac, kappa)
+set.seed(0)
+performance(test_rpart, measures = pm)
+performance(test_rf, measures = pm)
+performance(test_naiveBayes, measures = pm)
+performance(test_svm, measures = pm)
+```
+```{r include = TRUE, echo = FALSE}
+calculate_precisions <- function(pred){
+  cf <- (calculateConfusionMatrix(pred)$result %>% as.matrix())[1:3,1:3]
+  slight_prec <- cf[1,1]/sum(cf[1,])
+  serious_prec <- cf[2,2]/sum(cf[2,])
+  fatal_prec <- cf[3,3]/sum(cf[3,])
+  return(c(slight_prec, serious_prec, fatal_prec))
+}
+
+get_perf_row <- function(pred, name){
+  pm <- list(acc, bac, kappa)
+  ap <- performance(pred, measures = pm)
+  precs <- calculate_precisions(pred)
+  res <- tibble(
+    Algorithm = name,
+    Accuracy = ap[1],
+    Balanced_Accuracy = ap[2],
+    Kappa = ap[3],
+    Precision_Slight = precs[1],
+    Precision_Severe = precs[2],
+    Precision_Fatal = precs[3]
+  )
+  return(res)
+}
+
+rbind(get_perf_row(test_rpart, "Decision Tree"),
+      get_perf_row(test_rf, "Random Forest"),
+      get_perf_row(test_naiveBayes, "Naive Bayes"),
+      get_perf_row(test_svm, "SVM")) %>% 
+  knitr::kable(caption = "Various performance metrics of models tested against testing data.")
+```
+
+Because the testing set is unbalanced, accuracy is not the best evaluation metric. The percentage of 2018 accidents recorded as slight severity is `r nrow(filter(testing, Accident_Severity == "Slight"))/nrow(testing)*100`%, so the models fail to outperform a simplistic model that predicts slight severity regardless of input. More appropriate metrics are balanced accuracy and kappa values. Unfortunately these show that the overall performance of the models are poor, with kappa values showing only slight agreement between predicted and true labels.
+
+Precisions for class categories show the source of poor performance. We see that classification of severe accidents is particularly poor compared with slight and severe. From the exploratory data analysis, similarities between slight and severe accidents were found in the time and average age of casualty features, which were of high importance for the tree based algorithms.
+
+The most distinct result is with the Naive Bayes algorithm. This predicted slight accidents with good precision, resulting in a higher accuracy. However, performance for prediction of severe accidents was very poor. The decision tree model predicted fatal accidents with the highest accuracy although all other performance metrics are worse than with support vector machine and random forest, which have very similar performance.
+
+Because these trade-offs are present, the most successful algorithm for this classification problem is heavily dependent on the purposes at which classification is being used for. However I argue that the random forest algorithm provided the most balanced classifier, since it is observed to score best for balanced accuracy and kappa statistic along with displaying relatively good performance for all other metrics.
+
+# Conclusion
+This project has shown the difficulties with prediction of vehicle accident severity. Although variables that are related to accident severity have been identified, the implemented algorithms struggled to distinguish between slight and severe but non-fatal accidents. Fatal accidents were predicted with fairly good success, while severe accidents were predicted very poorly. An alternative classification problem could be developed to distinguish between fatal and non-fatal accidents. This would likely result in greater success.
+
